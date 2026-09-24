@@ -10,7 +10,9 @@
 //   ###away\t<フォーメーション>
 //   <選手名>\t<背番号>
 //
-// ローダーは毎回 ?t=時刻 付きで読み込むため、このファイルをpushすると次の実行から反映される。
+// ローダーは毎回 ?t=時刻 付きで jun-kanomata.github.io から読み込むため、pushすると次の実行から反映される。
+// ただしJリーグ公式はCSPで github.io を禁止しており、ローダーは公開リポジトリ jun-kanomata/players-list の
+// コピーを jsDelivr から読み込む。変更後は sync-players-list.sh で公開リポジトリへ同期すること。
 (() => {
   "use strict";
 

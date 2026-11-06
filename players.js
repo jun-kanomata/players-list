@@ -1,6 +1,7 @@
 // 📋 Players list ブックマークレット本体。
 // ローダー（bookmarklet/index.html のリンク）から読み込まれ、対応サイトの試合ページから
 // ホーム/アウェイの選手名・背番号を取り出して、Tacticalista の配置用TSVとしてコピーする。
+// Jリーグ公式とWEリーグのリーグ戦では、JPlayers に取り込むJSONもコピーできる（docs/lineup-json-spec.md）。
 //
 // 対応サイト: Google検索の試合情報（スタメンタブ） / Jリーグ公式 / スポーツナビ / WEリーグ
 //
@@ -17,7 +18,7 @@
   "use strict";
 
   const HOST_ID = "jk-players-list";
-  const VERSION = "2026.09.25";
+  const VERSION = "2026.11.06";
 
   // Tacticalista の11人制フォーメーション（util/Formation.ts footballFormations）と同じ並び
   const FORMATIONS = [
@@ -56,13 +57,26 @@
     const m = (value || "").match(/\d+(?:-\d+)+/);
     return m ? m[0] : null;
   };
-  const player = (name, num) => ({ name: clean(name), num: clean(num) });
+  // extra はJSON用の情報（position, id）。TSVは name と num だけを使う
+  const player = (name, num, extra) => ({ name: clean(name), num: clean(num), ...extra });
   const side = (name, formation, starters, subs) => ({
     name: clean(name) || null,
     formation: formation || null,
     starters,
     subs
   });
+
+  // 「GK 1」のような掲載の区分を読む。掲載がなければ null
+  const lineupPosition = (value) => {
+    const m = clean(value).match(/^(GK|DF|MF|FW)(?:\s|$)/);
+    return m ? m[1] : null;
+  };
+  // 要素自身か配下のリンク /player/{id}/ からIDを読む。リンクがなければ null
+  const playerLinkId = (el) => {
+    const link = el.matches("a[href]") ? el : el.querySelector("a[href]");
+    const m = link ? (link.getAttribute("href") || "").match(/\/player\/(\d+)(?:\/|$)/) : null;
+    return m ? m[1] : null;
+  };
 
   // root 配下のテキストを文書順に集める。exclude に当たる要素（ポップアップ等）の中は飛ばす
   function collectTexts(root, exclude) {
@@ -234,12 +248,28 @@
   const JL_STARTING = ".p-game-details-lineup-tab__starting-members .m-lineup-list__members";
   const JL_RESERVE = ".p-game-details-lineup-tab__reserve-members .m-lineup-list__members";
 
+  // 公式サイトはReactのストリーミングで描画し、インラインスクリプトの $RS("S:x","P:y") で
+  // 内容を差し込み位置へ移す。取得したHTMLではスクリプトが動かないので、同じ移動をここで行う。
+  // J2・J3などでは、これをしないと一覧が <section> の外に残りセレクタが一致しない
+  function applyStreamedSegments(doc) {
+    const scripts = [...doc.querySelectorAll("script")].map((script) => script.textContent).join("\n");
+    for (const m of scripts.matchAll(/\$RS\("([^"]+)","([^"]+)"\)/g)) {
+      const segment = doc.getElementById(m[1]);
+      const slot = doc.getElementById(m[2]);
+      if (!segment || !slot || !slot.parentNode) continue;
+      segment.remove();
+      while (segment.firstChild) slot.parentNode.insertBefore(segment.firstChild, slot);
+      slot.remove();
+    }
+  }
+
   async function parseJleague() {
     let doc = document;
     if (!doc.querySelector(JL_STARTING)) {
       const m = location.pathname.match(/^\/match\/[^/]+\/\d{4}\/\d+\//);
       if (!m) throw unsupportedPage();
       doc = await fetchDocument(m[0] + "lineup/");
+      applyStreamedSegments(doc);
     }
     const starters = jleagueMembers(doc, JL_STARTING);
     if (!starters.length) throw lineupNotAnnounced();
@@ -275,10 +305,11 @@
     return items
       .map((item, i) => {
         const name = textOf(item, ".m-lineup-list-item__name");
-        const num = (textOf(item, ".m-lineup-list-item__position").match(/\d+/) || [""])[0];
+        const label = textOf(item, ".m-lineup-list-item__position");
+        const num = (label.match(/\d+/) || [""])[0];
         if (!name) return null;
         const home = byLayout && lefts[i] !== null ? lefts[i] === homeLeft : i % 2 === 0;
-        return { name, num, home };
+        return { name, num, home, position: lineupPosition(label), id: playerLinkId(item) };
       })
       .filter(Boolean);
   }
@@ -365,28 +396,364 @@
   function weleagueRows(block) {
     const rows = { home: [], away: [] };
     if (!block) return rows;
-    const read = (numCell, nameCell) => {
+    const read = (positionCell, numCell, nameCell) => {
       if (!numCell || !nameCell) return null;
-      const name = clean((nameCell.querySelector(".name") || nameCell).textContent);
-      return name ? player(name, numCell.textContent) : null;
+      const nameEl = nameCell.querySelector(".name") || nameCell;
+      const name = clean(nameEl.textContent);
+      if (!name) return null;
+      return player(name, numCell.textContent, {
+        position: positionCell ? lineupPosition(positionCell.textContent) : null,
+        id: playerLinkId(nameEl)
+      });
     };
     block.querySelectorAll(".table-inner-flex").forEach((row) => {
       const cols = row.children;
       if (cols.length < 6) return;
-      const home = read(cols[1], cols[2]);
-      const away = read(cols[cols.length - 2], cols[cols.length - 1]);
+      const home = read(cols[0], cols[1], cols[2]);
+      const away = read(cols[cols.length - 3], cols[cols.length - 2], cols[cols.length - 1]);
       if (home) rows.home.push(home);
       if (away) rows.away.push(away);
     });
     return rows;
   }
 
+  // ---- ラインナップJSON（docs/lineup-json-spec.md） ----
+  const LINEUP_TYPE = "match-lineup";
+  const LINEUP_VERSION = 1;
+  const JLEAGUE_PLAYER_SCHEME = "jleague-player";
+  const WELEAGUE_PLAYER_SCHEME = "weleague-web-profile";
+  const JLEAGUE_PLACEMENT_SCHEME = "jleague-pitch-v1";
+  const KICKOFF_TIME = "前半0分";
+  const STARTERS_COUNT = 11;
+
+  // Jリーグ公式の試合ページにはシーズンの記載がないため、大会名と試合日を開催期間と照合する。
+  // シーズンが変わるたびに追記する。追記するまで新シーズンの試合はJSONを出力しない
+  const JLEAGUE_SEASONS = [
+    {
+      id: "2026-27",
+      name: "2026/27",
+      competitions: [
+        { label: "明治安田J1リーグ", id: "J1", from: "2026-08-07", to: "2027-06-06" },
+        { label: "明治安田J2リーグ", id: "J2", from: "2026-08-08", to: "2027-05-23" },
+        { label: "明治安田J3リーグ", id: "J3", from: "2026-08-08", to: "2027-05-23" }
+      ]
+    }
+  ];
+
+  const nfkc = (value) => clean(value).normalize("NFKC");
+  const pad2 = (value) => String(value).padStart(2, "0");
+
+  function matchUrlError() {
+    return new UserError(
+      "試合ページのURLを確認できないため、JSONを作成できません。",
+      "The match page URL could not be identified, so JSON is unavailable."
+    );
+  }
+
+  function seasonUnknownError() {
+    return new UserError(
+      "大会・シーズンを確認できないため、JSONを作成できません。",
+      "The competition or season could not be confirmed, so JSON is unavailable."
+    );
+  }
+
+  function unsupportedCompetitionError(label) {
+    return new UserError(
+      "「" + label + "」はJSONの対象外です。",
+      "JSON is not available for \"" + label + "\"."
+    );
+  }
+
+  async function fetchLineupDocument(url) {
+    let res;
+    try {
+      res = await fetch(url, { credentials: "same-origin" });
+    } catch (e) {
+      throw new UserError(
+        "ラインナップページを取得できませんでした。",
+        "Failed to load the lineup page."
+      );
+    }
+    if (!res.ok) {
+      throw new UserError(
+        "ラインナップページを取得できませんでした（HTTP " + res.status + "）",
+        "Failed to load the lineup page (HTTP " + res.status + ")"
+      );
+    }
+    return new DOMParser().parseFromString(await res.text(), "text/html");
+  }
+
+  // <title> の「（大会名：2026年8月7日）」から大会名と試合日（日本時間）を読み、対応表で判定する
+  function resolveJleagueMatch(doc) {
+    const m = (doc.title || "").match(/（([^（）：]+)：(\d{4})年(\d{1,2})月(\d{1,2})日）/);
+    if (!m) throw seasonUnknownError();
+    const label = clean(m[1]);
+    const date = m[2] + "-" + pad2(m[3]) + "-" + pad2(m[4]);
+    const normalized = nfkc(label);
+    const known = JLEAGUE_SEASONS.flatMap((season) =>
+      season.competitions.map((competition) => ({ season, competition })));
+    const sameName = known.filter((entry) => entry.competition.label === normalized);
+    if (!sameName.length) throw unsupportedCompetitionError(label);
+    const hit = sameName.find((entry) => entry.competition.from <= date && date <= entry.competition.to);
+    if (!hit) {
+      throw new UserError(
+        label + "の" + date + "に対応するシーズンを確認できません。",
+        "No season could be confirmed for " + label + " on " + date + "."
+      );
+    }
+    return {
+      label,
+      date,
+      competition: { id: hit.competition.id, name: label },
+      season: { id: hit.season.id, name: hit.season.name }
+    };
+  }
+
+  // 取得元の見出し「２０２６／２７ＷＥリーグ 第7節」からシーズンを読む
+  function resolveWeleagueMatch() {
+    const label = textOf(document, ".result_leg span");
+    if (!label) throw seasonUnknownError();
+    const m = nfkc(label).match(/^(\d{4})\/(\d{2})\s*(?:\S+\s+)?WEリーグ\s*第\d+節$/);
+    if (!m) throw unsupportedCompetitionError(label);
+    if ((Number(m[1]) + 1) % 100 !== Number(m[2])) throw seasonUnknownError();
+    return {
+      label,
+      competition: { id: "WE", name: "WEリーグ" },
+      season: { id: m[1] + "-" + m[2], name: m[1] + "/" + m[2] }
+    };
+  }
+
+  // 埋め込みデータ self.__next_f.push([1,"..."]) の文字列を順に連結する
+  function readFlightText(doc) {
+    const prefix = "self.__next_f.push([1,";
+    const suffix = "])";
+    const parts = [];
+    doc.querySelectorAll("script").forEach((script) => {
+      const text = script.textContent.trim().replace(/;$/, "");
+      if (text.startsWith(prefix) && text.endsWith(suffix)) {
+        parts.push(JSON.parse(text.slice(prefix.length, -suffix.length)));
+      }
+    });
+    return parts.join("");
+  }
+
+  // from の位置の [ に対応する ] までを切り出す。文字列の中の括弧は数えない
+  function sliceJsonArray(text, from) {
+    let depth = 0;
+    let inString = false;
+    for (let i = from; i < text.length; i++) {
+      const c = text[i];
+      if (inString) {
+        if (c === "\\") i++;
+        else if (c === '"') inString = false;
+      } else if (c === '"') {
+        inString = true;
+      } else if (c === "[") {
+        depth++;
+      } else if (c === "]" && --depth === 0) {
+        return text.slice(from, i + 1);
+      }
+    }
+    return null;
+  }
+
+  // キックオフ時点のフォーメーションを返す。読めない・条件を満たさないときは null。
+  // 画面のピッチ図はタイムラインの最後の時点なので、先発の配置には使えない
+  function readKickoffFormation(doc) {
+    try {
+      const text = readFlightText(doc);
+      const start = text.indexOf('"formations":[{"matchTime"');
+      if (start < 0) return null;
+      const json = sliceJsonArray(text, start + '"formations":'.length);
+      const kickoff = json && JSON.parse(json)[0];
+      if (!kickoff || kickoff.matchTime !== KICKOFF_TIME) return null;
+      const usable = [kickoff.homeTeam, kickoff.awayTeam].every((team) =>
+        team && Array.isArray(team.players) && team.players.length === STARTERS_COUNT &&
+        team.players.every((p) => p.playerNumber !== undefined && p.playerNumber !== null &&
+          Number.isFinite(p.positionX) && Number.isFinite(p.positionY)));
+      return usable ? kickoff : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  const clubCode = (href) => {
+    const m = (href || "").match(/^\/club\/([^/]+)\/?$/);
+    return m ? m[1] : null;
+  };
+
+  // 埋め込みデータとHTMLのクラブを照合し、一致すれば両チームのコードを返す。
+  // リンクはピッチ図の側にしかないので、一覧のチームとは名前で照合する
+  function verifyJleagueClubs(doc, kickoff, names) {
+    const codes = {};
+    for (const key of ["home", "away"]) {
+      const team = kickoff[key + "Team"];
+      const link = doc.querySelector(".o-formation__team-info--" + key);
+      const code = clubCode(link && link.getAttribute("href"));
+      if (!code || code !== clubCode(team.teamURL)) return null;
+      if (nfkc(team.teamName) !== nfkc(names[key])) return null;
+      codes[key] = code;
+    }
+    return codes;
+  }
+
+  function assertStartersCount(home, away) {
+    [["ホーム", "Home", home], ["アウェイ", "Away", away]].forEach(([ja, en, team]) => {
+      const count = team.starters.length;
+      if (count === STARTERS_COUNT) return;
+      const verb = count < STARTERS_COUNT ? "人しか確認できない" : "人確認された";
+      throw new UserError(
+        (team.name || ja) + "の先発を" + count + verb + "ため、JSONを作成できません（11人を想定）。",
+        (team.name || en) + ": " + count + " starters found (expected 11), so JSON is unavailable."
+      );
+    });
+  }
+
+  function assertSameStarters(starters, kickoffTeam) {
+    const listed = starters.map((p) => p.num).sort();
+    const embedded = kickoffTeam.players.map((p) => String(p.playerNumber)).sort();
+    // 重複があると背番号で結合したときに別の選手へ同じIDと配置が付くので、一意であることも確かめる
+    const unique = (numbers) => new Set(numbers).size === numbers.length;
+    const sameNumbers = unique(listed) && unique(embedded) && listed.length === embedded.length &&
+      listed.every((num, i) => num === embedded[i]);
+    const sameIds = sameNumbers && starters.every((p) => {
+      const found = kickoffTeam.players.find((q) => String(q.playerNumber) === p.num);
+      return !p.id || found.id === undefined || found.id === null || String(found.id) === p.id;
+    });
+    if (!sameIds) {
+      throw new UserError(
+        "ラインナップとフォーメーションの内容が一致しないため、JSONを作成できません。",
+        "The lineup and formation data disagree, so JSON is unavailable."
+      );
+    }
+  }
+
+  function lineupPlayer(p, scheme, kickoffPlayer) {
+    const embeddedId = kickoffPlayer && kickoffPlayer.id !== undefined && kickoffPlayer.id !== null
+      ? String(kickoffPlayer.id)
+      : null;
+    const id = embeddedId || p.id || null;
+    return {
+      name: p.name,
+      number: /^\d+$/.test(p.num) ? Number(p.num) : null,
+      position: p.position || null,
+      sourcePlayerId: id ? { scheme, value: id } : null,
+      placement: kickoffPlayer ? { x: kickoffPlayer.positionX, y: kickoffPlayer.positionY } : null
+    };
+  }
+
+  async function buildJleagueLineup() {
+    const base = (location.pathname.match(/^(\/match\/[^/]+\/\d{4}\/\d+)(?:\/|$)/) || [])[1];
+    if (!base) throw matchUrlError();
+    const doc = await fetchLineupDocument(base + "/lineup/");
+    applyStreamedSegments(doc);
+    const info = resolveJleagueMatch(doc);
+    const starters = jleagueMembers(doc, JL_STARTING);
+    if (!starters.length) throw lineupNotAnnounced();
+    const reserves = jleagueMembers(doc, JL_RESERVE);
+    const names = { home: jleagueClubName(doc, "home"), away: jleagueClubName(doc, "away") };
+    if (!names.home || !names.away) {
+      throw new UserError(
+        "チームを確認できないため、JSONを作成できません。",
+        "The teams could not be confirmed, so JSON is unavailable."
+      );
+    }
+    const startersOf = (isHome) => starters.filter((p) => p.home === isHome);
+    assertStartersCount(
+      { name: names.home, starters: startersOf(true) },
+      { name: names.away, starters: startersOf(false) }
+    );
+
+    const kickoff = readKickoffFormation(doc);
+    const codes = kickoff ? verifyJleagueClubs(doc, kickoff, names) : null;
+    if (codes) {
+      assertSameStarters(startersOf(true), kickoff.homeTeam);
+      assertSameStarters(startersOf(false), kickoff.awayTeam);
+    }
+    const build = (key, isHome) => {
+      const team = codes ? kickoff[key + "Team"] : null;
+      const byNumber = new Map(team ? team.players.map((p) => [String(p.playerNumber), p]) : []);
+      return {
+        name: names[key],
+        sourceTeamCode: codes ? codes[key] : null,
+        formation: (team && team.formation) || null,
+        starters: startersOf(isHome).map((p) => lineupPlayer(p, JLEAGUE_PLAYER_SCHEME, byNumber.get(p.num))),
+        subs: reserves.filter((p) => p.home === isHome).map((p) => lineupPlayer(p, JLEAGUE_PLAYER_SCHEME))
+      };
+    };
+    return {
+      summary: info.label + " " + info.season.name,
+      listOnly: !codes,
+      json: {
+        type: LINEUP_TYPE,
+        version: LINEUP_VERSION,
+        placementScheme: codes ? JLEAGUE_PLACEMENT_SCHEME : null,
+        match: {
+          source: "jleague",
+          sourceUrl: location.origin + base + "/",
+          sourceLabel: info.label,
+          date: info.date,
+          competition: info.competition,
+          season: info.season
+        },
+        home: build("home", true),
+        away: build("away", false)
+      }
+    };
+  }
+
+  // .result_day は年を含まないので、URLの試合IDの日付と月日が一致するときだけ試合日とする
+  function weleagueDate(idDate) {
+    const m = textOf(document, ".result_day").match(/^(\d{1,2})\/(\d{1,2})(?:\D|$)/);
+    if (!m || Number(m[1]) !== Number(idDate.month) || Number(m[2]) !== Number(idDate.day)) return null;
+    return idDate.year + "-" + idDate.month + "-" + idDate.day;
+  }
+
+  function weleagueClubCode(key) {
+    const link = document.querySelector(".nextmatch-" + key + " a[href^='/clubs/']");
+    const m = link ? link.getAttribute("href").match(/^\/clubs\/([^/]+)\/?$/) : null;
+    return m ? m[1] : null;
+  }
+
+  async function buildWeleagueLineup(match) {
+    const m = location.pathname.match(/^\/matches\/((\d{4})(\d{2})(\d{2})\d*)(?:\/|$)/);
+    if (!m) throw matchUrlError();
+    const info = resolveWeleagueMatch();
+    assertStartersCount(match.home, match.away);
+    const build = (key) => ({
+      name: match[key].name,
+      sourceTeamCode: weleagueClubCode(key),
+      formation: null,
+      starters: match[key].starters.map((p) => lineupPlayer(p, WELEAGUE_PLAYER_SCHEME)),
+      subs: match[key].subs.map((p) => lineupPlayer(p, WELEAGUE_PLAYER_SCHEME))
+    });
+    return {
+      summary: info.label,
+      listOnly: false,
+      json: {
+        type: LINEUP_TYPE,
+        version: LINEUP_VERSION,
+        placementScheme: null,
+        match: {
+          source: "weleague",
+          sourceUrl: location.origin + "/matches/" + m[1] + "/",
+          sourceLabel: info.label,
+          date: weleagueDate({ year: m[2], month: m[3], day: m[4] }),
+          competition: info.competition,
+          season: info.season
+        },
+        home: build("home"),
+        away: build("away")
+      }
+    };
+  }
+
   // ---- サイト判定 ----
   const SITES = [
     { host: /(^|\.)google\.[a-z.]+$/, ja: "Google", en: "Google", parse: parseGoogle },
-    { host: /(^|\.)jleague\.jp$/, ja: "Jリーグ公式", en: "J.LEAGUE", parse: parseJleague },
+    { host: /(^|\.)jleague\.jp$/, ja: "Jリーグ公式", en: "J.LEAGUE", parse: parseJleague, lineup: buildJleagueLineup },
     { host: /(^|\.)yahoo\.co\.jp$/, ja: "スポーツナビ", en: "Sportsnavi", parse: parseSportsnavi },
-    { host: /(^|\.)weleague\.jp$/, ja: "WEリーグ", en: "WE LEAGUE", parse: parseWeleague }
+    { host: /(^|\.)weleague\.jp$/, ja: "WEリーグ", en: "WE LEAGUE", parse: parseWeleague, lineup: buildWeleagueLineup }
   ];
 
   function unsupportedPage() {
@@ -554,6 +921,16 @@ textarea {
 .btn.primary.done { background: var(--ok); }
 .btn.secondary { border: 1px solid var(--line); background: var(--bg); color: var(--sub); }
 .btn.secondary:hover { background: var(--surface); }
+.btn:disabled { opacity: .55; cursor: default; }
+.btn.secondary:disabled:hover { background: var(--bg); }
+.btn.secondary.done { border-color: var(--ok); color: var(--ok); }
+.json-row { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.json-head { display: flex; align-items: center; gap: 8px; }
+.json-summary { flex: 1; min-width: 0; font-size: 12px; font-weight: 700; }
+.json-note { margin-top: 4px; font-size: 11px; color: var(--sub); }
+.json-row .notice { margin: 8px 0 0; }
+/* クリップボードAPIが使えないときに選択してコピーするため、display: none にしない */
+.offscreen { position: fixed; top: 0; left: -9999px; width: 1px; height: 1px; opacity: 0; resize: none; }
 .footer { display: flex; justify-content: space-between; gap: 8px; margin-top: 8px; font-size: 10px; color: var(--faint); }
 .loading { display: flex; align-items: center; gap: 8px; padding: 6px 0; color: var(--sub); }
 .spinner {
@@ -645,6 +1022,66 @@ textarea {
     );
   }
 
+  function attachCopy(button, label, copy) {
+    let resetTimer = null;
+    button.addEventListener("click", async () => {
+      const ok = await copy();
+      clearTimeout(resetTimer);
+      button.classList.toggle("done", ok);
+      button.replaceChildren(ok ? bi("コピーしました ✓", "Copied") : bi("コピーできませんでした", "Copy failed"));
+      resetTimer = setTimeout(() => {
+        button.classList.remove("done");
+        button.replaceChildren(label());
+      }, 2200);
+    });
+  }
+
+  // JSONの組み立ては非同期に行い、成否はTSVの操作に影響させない
+  function lineupRow(site, match) {
+    if (!site.lineup) return null;
+    const label = () => bi("JSONをコピー", "Copy JSON");
+    const field = h("textarea", {
+      class: "offscreen", readonly: true, tabindex: "-1", "aria-hidden": "true", wrap: "off"
+    });
+    const button = h("button", { class: "btn secondary", type: "button", disabled: true }, label());
+    const summary = h("div", { class: "json-summary" }, bi("確認中…", "Checking…"));
+    const details = h("div", { role: "status" });
+    attachCopy(button, label, async () => {
+      const ok = await copyText(field.value, field);
+      button.focus({ preventScroll: true });
+      return ok;
+    });
+
+    const notice = (ja, en) => h("div", { class: "notice warn" },
+      h("p", null, ja, h("span", { class: "en" }, en)));
+    (async () => {
+      try {
+        const lineup = await site.lineup(match);
+        field.value = JSON.stringify(lineup.json, null, 2);
+        button.disabled = false;
+        fill(summary, lineup.summary);
+        fill(details,
+          lineup.listOnly
+            ? notice("フォーメーションと配置を取得できませんでした。", "Formations and positions could not be read.")
+            : null,
+          h("div", { class: "json-note" },
+            bi("JPlayersに貼り付けて取り込み。上の選択や編集は反映されません",
+              "Paste into JPlayers. Choices and edits above are not applied.")));
+      } catch (error) {
+        if (!(error instanceof UserError)) console.error("[Players list]", error);
+        const known = error instanceof UserError;
+        fill(summary, "JSON");
+        fill(details, notice(
+          known ? error.ja : "JSONを作成できませんでした。ページの形式が変わった可能性があります。",
+          known ? error.en : "JSON is unavailable. The page layout may have changed."));
+      }
+    })();
+    return h("div", { class: "json-row" },
+      h("div", { class: "json-head" }, summary, button),
+      details,
+      field);
+  }
+
   function renderResult(ui, site, match) {
     const state = {
       startersOnly: false,
@@ -707,17 +1144,7 @@ textarea {
     const warnings = collectWarnings(match);
     const copyLabel = () => bi("TSVをコピー", "Copy TSV");
     const copyBtn = h("button", { class: "btn primary", type: "button" }, copyLabel());
-    let resetTimer = null;
-    copyBtn.addEventListener("click", async () => {
-      const ok = await copyText(preview.value, preview);
-      clearTimeout(resetTimer);
-      copyBtn.classList.toggle("done", ok);
-      copyBtn.replaceChildren(ok ? bi("コピーしました ✓", "Copied") : bi("コピーできませんでした", "Copy failed"));
-      resetTimer = setTimeout(() => {
-        copyBtn.classList.remove("done");
-        copyBtn.replaceChildren(copyLabel());
-      }, 2200);
-    });
+    attachCopy(copyBtn, copyLabel, () => copyText(preview.value, preview));
 
     const title = match.home.name && match.away.name ? match.home.name + " vs " + match.away.name : null;
     fill(ui.panel,
@@ -734,6 +1161,7 @@ textarea {
       h("div", { class: "actions" },
         copyBtn,
         h("button", { class: "btn secondary", type: "button", onclick: ui.close }, bi("閉じる", "Close"))),
+      lineupRow(site, match),
       h("div", { class: "footer" },
         bi("Tacticalistaに貼り付けて配置", "Paste into Tacticalista"),
         h("span", null, "v" + VERSION))

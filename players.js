@@ -1,7 +1,7 @@
 // 📋 Players list ブックマークレット本体。
 // ローダー（bookmarklet/index.html のリンク）から読み込まれ、対応サイトの試合ページから
 // ホーム/アウェイの選手名・背番号を取り出して、Tacticalista の配置用TSVとしてコピーする。
-// Jリーグ公式とWEリーグのリーグ戦では、JPlayers に取り込むJSONもコピーできる（docs/lineup-json-spec.md）。
+// Jリーグ公式（J1・J2・J3・U-21）とWEリーグのリーグ戦では、JPlayers に取り込むJSONもコピーできる（docs/lineup-json-spec.md）。
 //
 // 対応サイト: Google検索の試合情報（スタメンタブ） / Jリーグ公式 / スポーツナビ / WEリーグ
 //
@@ -18,7 +18,7 @@
   "use strict";
 
   const HOST_ID = "jk-players-list";
-  const VERSION = "2026.11.06";
+  const VERSION = "2026.11.22";
 
   // Tacticalista の11人制フォーメーション（util/Formation.ts footballFormations）と同じ並び
   const FORMATIONS = [
@@ -271,9 +271,10 @@
       doc = await fetchDocument(m[0] + "lineup/");
       applyStreamedSegments(doc);
     }
-    const starters = jleagueMembers(doc, JL_STARTING);
+    // 名前が空の選手はJSONの補完用に残るので、TSVでは従来どおり除く
+    const starters = jleagueMembers(doc, JL_STARTING).filter((p) => p.name);
     if (!starters.length) throw lineupNotAnnounced();
-    const reserves = jleagueMembers(doc, JL_RESERVE);
+    const reserves = jleagueMembers(doc, JL_RESERVE).filter((p) => p.name);
     const build = (isHome) => {
       const key = isHome ? "home" : "away";
       return side(
@@ -288,7 +289,8 @@
   }
 
   // 2カラム（左=ホーム、右=アウェイ）を交互に並べたDOM。
-  // 画面上で2列に並んでいれば位置で、そうでなければ（取得したHTML・1列表示）DOM順の偶奇で判定する
+  // 画面上で2列に並んでいれば位置で、そうでなければ（取得したHTML・1列表示）DOM順の偶奇で判定する。
+  // 名前欄が空でも選手ページへのリンクがある項目は、JSONで名前を補えるように name: "" で残す
   function jleagueMembers(doc, selector) {
     const list = doc.querySelector(selector);
     if (!list) return [];
@@ -307,9 +309,10 @@
         const name = textOf(item, ".m-lineup-list-item__name");
         const label = textOf(item, ".m-lineup-list-item__position");
         const num = (label.match(/\d+/) || [""])[0];
-        if (!name) return null;
+        const id = playerLinkId(item);
+        if (!name && !id) return null;
         const home = byLayout && lefts[i] !== null ? lefts[i] === homeLeft : i % 2 === 0;
-        return { name, num, home, position: lineupPosition(label), id: playerLinkId(item) };
+        return { name, num, home, position: lineupPosition(label), id };
       })
       .filter(Boolean);
   }
@@ -425,9 +428,14 @@
   const JLEAGUE_PLACEMENT_SCHEME = "jleague-pitch-v1";
   const KICKOFF_TIME = "前半0分";
   const STARTERS_COUNT = 11;
+  // 選手ページは1件0.8〜1MBあるので、補う人数と同時の取得を抑え、止まった取得は打ち切る
+  const NAME_FILL_LIMIT = 8;
+  const NAME_FILL_CONCURRENCY = 3;
+  const NAME_FETCH_TIMEOUT_MS = 8000;
 
   // Jリーグ公式の試合ページにはシーズンの記載がないため、大会名と試合日を開催期間と照合する。
-  // シーズンが変わるたびに追記する。追記するまで新シーズンの試合はJSONを出力しない
+  // シーズンが変わるたびに追記する。追記するまで新シーズンの試合はJSONを出力しない。
+  // formationListed: false は試合ページにフォーメーションの掲載がない大会で、取得できなかった旨を表示しない
   const JLEAGUE_SEASONS = [
     {
       id: "2026-27",
@@ -435,7 +443,9 @@
       competitions: [
         { label: "明治安田J1リーグ", id: "J1", from: "2026-08-07", to: "2027-06-06" },
         { label: "明治安田J2リーグ", id: "J2", from: "2026-08-08", to: "2027-05-23" },
-        { label: "明治安田J3リーグ", id: "J3", from: "2026-08-08", to: "2027-05-23" }
+        { label: "明治安田J3リーグ", id: "J3", from: "2026-08-08", to: "2027-05-23" },
+        // 終わりは大会概要の「2027年4月第3週頃」による暫定。12月下旬の日程発表後に見直す
+        { label: "U-21 Jリーグ", id: "U21", from: "2026-08-22", to: "2027-04-30", formationListed: false }
       ]
     }
   ];
@@ -504,6 +514,7 @@
     return {
       label,
       date,
+      formationListed: hit.competition.formationListed !== false,
       competition: { id: hit.competition.id, name: label },
       season: { id: hit.season.id, name: hit.season.name }
     };
@@ -597,6 +608,72 @@
     return codes;
   }
 
+  // 試合ヘッダーのクラブのリンクから両チームのコードを読む。ヘッダーのチーム名が一覧と一致しなければ null。
+  // 取得したHTMLには読み込み中の表示用にリンクのない同じクラスの要素が先にあるので、a[href] を対象にする
+  function readJleagueHeaderClubs(doc, names) {
+    const codes = {};
+    for (const key of ["home", "away"]) {
+      const link = doc.querySelector("a.o-page-header__club--" + key + "[href]");
+      const code = clubCode(link && link.getAttribute("href"));
+      const labelled = link && link.querySelector("[aria-label]");
+      const name = labelled ? labelled.getAttribute("aria-label") : "";
+      if (!code || !name || nfkc(name) !== nfkc(names[key])) return null;
+      codes[key] = code;
+    }
+    return codes;
+  }
+
+  // ヘッダーとピッチ図のどちらかで確認できたコードを使う。両方あって食い違うときは決めない
+  function chooseClubCodes(headerCodes, formationCodes) {
+    if (headerCodes && formationCodes) {
+      const agree = headerCodes.home === formationCodes.home && headerCodes.away === formationCodes.away;
+      return agree ? headerCodes : { home: null, away: null };
+    }
+    return headerCodes || formationCodes || { home: null, away: null };
+  }
+
+  // 選手ページの <title>「【公式】名前 | クラブ名 | Ｊリーグ公式サイト」から名前を読む。
+  // ヘッダーの受信から本文の読み取りまでを含めて打ち切る。失敗・形式違い・クラブ違いは null
+  async function fetchPlayerName(id, teamName) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), NAME_FETCH_TIMEOUT_MS);
+    try {
+      const res = await fetch("/player/" + id + "/", { credentials: "same-origin", signal: controller.signal });
+      if (!res.ok) return null;
+      const html = await res.text();
+      const raw = (html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1];
+      if (!raw) return null;
+      const title = clean(new DOMParser().parseFromString("<title>" + raw + "</title>", "text/html").title);
+      const m = title.match(/^【公式】(.+?) \| (.+?) \| Ｊリーグ公式サイト$/);
+      if (!m) return null;
+      // U-21のチーム名は「U-21 名古屋グランパス」、選手ページのクラブ名はトップチームの「名古屋グランパス」
+      const team = nfkc(teamName).replace(/^U-21\s+/, "");
+      return nfkc(m[2]) === team ? clean(m[1]) : null;
+    } catch (e) {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // 名前欄が空でリンクのある選手に、一覧の順で上限まで名前を補う。補った人数を返す
+  async function fillMissingNames(players, names) {
+    const queue = players.filter((p) => !p.name && p.id).slice(0, NAME_FILL_LIMIT);
+    let filled = 0;
+    const worker = async () => {
+      while (queue.length) {
+        const p = queue.shift();
+        const name = await fetchPlayerName(p.id, names[p.home ? "home" : "away"]);
+        if (name) {
+          p.name = name;
+          filled++;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(NAME_FILL_CONCURRENCY, queue.length) }, worker));
+    return filled;
+  }
+
   function assertStartersCount(home, away) {
     [["ホーム", "Home", home], ["アウェイ", "Away", away]].forEach(([ja, en, team]) => {
       const count = team.starters.length;
@@ -648,9 +725,9 @@
     const doc = await fetchLineupDocument(base + "/lineup/");
     applyStreamedSegments(doc);
     const info = resolveJleagueMatch(doc);
-    const starters = jleagueMembers(doc, JL_STARTING);
-    if (!starters.length) throw lineupNotAnnounced();
-    const reserves = jleagueMembers(doc, JL_RESERVE);
+    const listedStarters = jleagueMembers(doc, JL_STARTING);
+    if (!listedStarters.length) throw lineupNotAnnounced();
+    const listedReserves = jleagueMembers(doc, JL_RESERVE);
     const names = { home: jleagueClubName(doc, "home"), away: jleagueClubName(doc, "away") };
     if (!names.home || !names.away) {
       throw new UserError(
@@ -658,6 +735,10 @@
         "The teams could not be confirmed, so JSON is unavailable."
       );
     }
+    // 補えなかった選手は従来どおり除く。先発が欠ければ次の人数の確認で止まる
+    const filledNames = await fillMissingNames(listedStarters.concat(listedReserves), names);
+    const starters = listedStarters.filter((p) => p.name);
+    const reserves = listedReserves.filter((p) => p.name);
     const startersOf = (isHome) => starters.filter((p) => p.home === isHome);
     assertStartersCount(
       { name: names.home, starters: startersOf(true) },
@@ -665,17 +746,18 @@
     );
 
     const kickoff = readKickoffFormation(doc);
-    const codes = kickoff ? verifyJleagueClubs(doc, kickoff, names) : null;
-    if (codes) {
+    const formationCodes = kickoff ? verifyJleagueClubs(doc, kickoff, names) : null;
+    if (formationCodes) {
       assertSameStarters(startersOf(true), kickoff.homeTeam);
       assertSameStarters(startersOf(false), kickoff.awayTeam);
     }
+    const teamCodes = chooseClubCodes(readJleagueHeaderClubs(doc, names), formationCodes);
     const build = (key, isHome) => {
-      const team = codes ? kickoff[key + "Team"] : null;
+      const team = formationCodes ? kickoff[key + "Team"] : null;
       const byNumber = new Map(team ? team.players.map((p) => [String(p.playerNumber), p]) : []);
       return {
         name: names[key],
-        sourceTeamCode: codes ? codes[key] : null,
+        sourceTeamCode: teamCodes[key],
         formation: (team && team.formation) || null,
         starters: startersOf(isHome).map((p) => lineupPlayer(p, JLEAGUE_PLAYER_SCHEME, byNumber.get(p.num))),
         subs: reserves.filter((p) => p.home === isHome).map((p) => lineupPlayer(p, JLEAGUE_PLAYER_SCHEME))
@@ -683,11 +765,14 @@
     };
     return {
       summary: info.label + " " + info.season.name,
-      listOnly: !codes,
+      // 掲載があるはずのフォーメーションを使えなかったときだけ注意書きを出す
+      formationMissing: !formationCodes && info.formationListed,
+      filledNames,
+      missingSubs: listedReserves.length - reserves.length,
       json: {
         type: LINEUP_TYPE,
         version: LINEUP_VERSION,
-        placementScheme: codes ? JLEAGUE_PLACEMENT_SCHEME : null,
+        placementScheme: formationCodes ? JLEAGUE_PLACEMENT_SCHEME : null,
         match: {
           source: "jleague",
           sourceUrl: location.origin + base + "/",
@@ -729,7 +814,9 @@
     });
     return {
       summary: info.label,
-      listOnly: false,
+      formationMissing: false,
+      filledNames: 0,
+      missingSubs: 0,
       json: {
         type: LINEUP_TYPE,
         version: LINEUP_VERSION,
@@ -1061,8 +1148,17 @@ textarea {
         button.disabled = false;
         fill(summary, lineup.summary);
         fill(details,
-          lineup.listOnly
+          lineup.formationMissing
             ? notice("フォーメーションと配置を取得できませんでした。", "Formations and positions could not be read.")
+            : null,
+          lineup.missingSubs
+            ? notice("名前を確認できない控えが" + lineup.missingSubs + "人いるため、JSONに含めていません。",
+              lineup.missingSubs + " substitutes without a name are not included.")
+            : null,
+          lineup.filledNames
+            ? h("div", { class: "json-note" },
+              bi("選手ページから名前を補いました（" + lineup.filledNames + "人）",
+                "Filled " + lineup.filledNames + " names from player pages."))
             : null,
           h("div", { class: "json-note" },
             bi("JPlayersに貼り付けて取り込み。上の選択や編集は反映されません",
